@@ -12,7 +12,7 @@ main.o: main.c
 	cc $(CFLAGS) -c $^ -o $@
 
 install: apc2mqtt
-	install apc2mqtt -m755 $(DESTDIR)/$(PREFIX)/bin/
+	install -D -m755 apc2mqtt $(DESTDIR)/$(PREFIX)/bin/apc2mqtt
 
 clean:
 	rm -f apc2mqtt
