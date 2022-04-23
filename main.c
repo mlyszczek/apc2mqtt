@@ -7,8 +7,7 @@
 #include <sys/types.h>
 #include <termios.h>
 #include <unistd.h>
-
-#include "valid.h"
+#include <bsd/sys/time.h>
 
 /* ==========================================================================
                      ____ _ / /____   / /_   ____ _ / /_____
@@ -111,7 +110,7 @@ void apc_init(int fd)
    ========================================================================== */
 int apc_cmd_to_mqtt(int fd, char cmd, const char *topic)
 {
-	int r;
+	int r, raed;
 	char buf[apc_buflen];
 	/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
 
@@ -119,16 +118,72 @@ int apc_cmd_to_mqtt(int fd, char cmd, const char *topic)
 	memset(buf, 0x00, sizeof(buf));
 	write(fd, &cmd, sizeof(cmd));
 
-	r = read(fd, buf, apc_buflen);
-	if (r == 0)
-		return_print(-1, "read 0 bytes from serial");
-	if (r < 0)
-		return_perror("read()");
+	/* apc has speed of 2400b/s, it's so slow we will be reading
+	 * byte at a time from serial, so read in loop until '\n'
+	 * is seen */
+	for (raed = 0;;)
+	{
+		r = read(fd, buf + raed, sizeof(buf) - raed);
+		if (r == 0)
+			return_print(-1, "read 0 bytes from serial");
+		if (r < 0)
+			return_perror("read()");
+
+		raed += r;
+		if (strchr(buf, '\n') == NULL)
+			continue;
+
+		break;
+	}
 
 	/* apc will return us \r\n */
 	buf[strcspn(buf, "\r")] = '\0';
-	if (mosquitto_publish(mqtt, NULL, topic, strlen(buf), buf, 2, 0))
-		return_perror("mosquitto_publish(%s, %s)", topic, buf);
+	switch (cmd)
+	{
+		unsigned char  status, s;
+		char           t[128];
+		char          *endptr;
+		/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+
+
+	case 'Q':
+		/* Q is bitmapped status, we we have to
+		 * send multiple mqtt frames with it */
+		if (strlen(buf) != 2)
+			return_print(-1, "Q: expected 2 bytes, got: %s", buf);
+
+		status = strtol(buf, &endptr, 16);
+		if (*endptr != '\0')
+			return_print(-1, "Q: invalid status, got: %s", buf);
+
+		r = 0;
+
+		s = status & 0x08 ? '1' : '0';
+		sprintf(t, "%son-line", topic);
+		r |= mosquitto_publish(mqtt, NULL, t, 1, &s, 2, 0);
+		s = status & 0x10 ? '1' : '0';
+		sprintf(t, "%son-battery", topic);
+		r |= mosquitto_publish(mqtt, NULL, t, 1, &s, 2, 0);
+		s = status & 0x20 ? '1' : '0';
+		sprintf(t, "%soverloaded-output", topic);
+		r |= mosquitto_publish(mqtt, NULL, t, 1, &s, 2, 0);
+		s = status & 0x40 ? '1' : '0';
+		sprintf(t, "%sbattery-low", topic);
+		r |= mosquitto_publish(mqtt, NULL, t, 1, &s, 2, 0);
+		s = status & 0x80 ? '1' : '0';
+		sprintf(t, "%sreplace-battery", topic);
+		r |= mosquitto_publish(mqtt, NULL, t, 1, &s, 2, 0);
+		break;
+
+
+	default:
+		r = mosquitto_publish(mqtt, NULL, topic, strlen(buf), buf, 2, 0);
+	}
+
+
+	if (r)
+		return_print(ELW, "mosquitto_publish(%s, %s): %s",
+				topic, buf, mosquitto_strerror(r));
 
 	return 0;
 }
@@ -183,18 +238,40 @@ int main(int argc, char *argv[])
 
 	for (;;)
 	{
+		struct timespec  start;
+		struct timespec  stop;
+		struct timespec  diff;
+		struct timespec  one_sec;
+		struct timespec  to_sleep;
+		/*~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~*/
+
+
+		clock_gettime(CLOCK_MONOTONIC, &start);
 		ret = 0;
 		ret |= apc_cmd_to_mqtt(fd, 'L', "/apc/input/voltage");
-		ret |= apc_cmd_to_mqtt(fd, '/', "/apc/power/load");
+		ret |= apc_cmd_to_mqtt(fd, 'P', "/apc/power/load");
 		ret |= apc_cmd_to_mqtt(fd, 'C', "/apc/temperature");
 		ret |= apc_cmd_to_mqtt(fd, 'f', "/apc/battery/charge");
 		ret |= apc_cmd_to_mqtt(fd, 'B', "/apc/battery/voltage");
 		ret |= apc_cmd_to_mqtt(fd, 'j', "/apc/estimated-runtime");
+		ret |= apc_cmd_to_mqtt(fd, 'Q', "/apc/status/");
 
 		if (ret)
 			apc_init(fd);
+		clock_gettime(CLOCK_MONOTONIC, &stop);
 
-		sleep(1);
+		/* try to poll apc once every second, regardless of how
+		 * much time we spent communicating with it */
+
+		timespecsub(&stop, &start, &diff);
+		/* if we are in loop for more than one
+		 * second, poll next data right away */
+		if (diff.tv_sec > 1) continue;
+		/* otherwise sleep for 1sec - time-taken */
+		one_sec.tv_sec = 1;
+		one_sec.tv_nsec = 0;
+		timespecsub(&one_sec, &diff, &to_sleep);
+		nanosleep(&to_sleep, NULL);
 	}
 
 	close(fd);
